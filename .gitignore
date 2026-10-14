@@ -1,0 +1,19 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Android build output (generated, not meant to be versioned)
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/captures/
+android/*.iml
+android/.idea/
+
+# Signed APKs/keystores — NEVER commit your keystore. Keep it somewhere
+# safe and separate (a password manager, encrypted backup, etc.) — losing
+# it means you can never publish an update to the same installed app.
+*.keystore
+*.jks
+*-release.apk
