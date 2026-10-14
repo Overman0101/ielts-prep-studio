@@ -1,0 +1,774 @@
+/* ============================================================
+   Shared data model + storage layer for IELTS Prep Studio.
+   Included by both index.html (student) and admin.html (admin).
+   Uses IndexedDB so content persists on-device, fully offline.
+   ============================================================ */
+
+const DB_NAME = 'ielts-prep-db';
+const DB_VERSION = 2; // v2 adds 'media' (images) and 'lessons' stores
+
+const SECTION_META = {
+  listening:{ label:'Listening', time: 30*60 },
+  reading:{ label:'Reading', time: 60*60 },
+  writing:{ label:'Writing', time: 60*60 },
+  speaking:{ label:'Speaking', time: 15*60 },
+};
+const SECTION_ORDER = ['listening','reading','writing','speaking'];
+const QUESTIONS_PER_PAGE = 5;
+
+/* ---------- small utils ---------- */
+function uid(){ return 'id-' + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+function fmtTime(sec){
+  sec = Math.max(0, sec);
+  const m = Math.floor(sec/60).toString().padStart(2,'0');
+  const s = Math.floor(sec%60).toString().padStart(2,'0');
+  return m+':'+s;
+}
+function wordCount(str){
+  return (str.trim().match(/\S+/g) || []).length;
+}
+function escapeHtml(str){
+  return String(str ?? '').replace(/[&<>"']/g, s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+}
+function escapeAttr(str){ return escapeHtml(str); }
+
+function showToast(msg){
+  const t = document.getElementById('toast');
+  if(!t) return;
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(()=>t.classList.remove('show'), 1600);
+}
+
+/* ============================================================
+   Lightweight markdown-style renderer for passages, instructions,
+   and lesson bodies. Deliberately simple — not full markdown:
+     blank line       -> new paragraph
+     ## Heading       -> heading
+     a) / b) / c) ... -> lettered list
+     - item           -> bullet list
+   Everything else is treated as plain paragraph text (escaped).
+   ============================================================ */
+function renderMarkdownLite(text){
+  const lines = String(text ?? '').split('\n');
+  let html = '';
+  let paraBuffer = [];
+  let listBuffer = [];
+  let listType = null; // 'ul' | 'ol'
+
+  function flushPara(){
+    if(paraBuffer.length){
+      html += `<p>${escapeHtml(paraBuffer.join(' '))}</p>`;
+      paraBuffer = [];
+    }
+  }
+  function flushList(){
+    if(listBuffer.length){
+      const tag = listType === 'ol' ? 'ol' : 'ul';
+      const attrs = listType === 'ol' ? ' type="a"' : '';
+      html += `<${tag}${attrs}>${listBuffer.map(li=>`<li>${escapeHtml(li)}</li>`).join('')}</${tag}>`;
+    }
+    listBuffer = []; listType = null;
+  }
+
+  lines.forEach(raw=>{
+    const line = raw.trim();
+    if(line === ''){ flushPara(); flushList(); return; }
+
+    const heading = line.match(/^##\s+(.*)$/);
+    if(heading){ flushPara(); flushList(); html += `<h4 class="passage-heading">${escapeHtml(heading[1])}</h4>`; return; }
+
+    const alpha = line.match(/^[a-zA-Z]\)\s+(.*)$/);
+    if(alpha){
+      flushPara();
+      if(listType && listType !== 'ol') flushList();
+      listType = 'ol';
+      listBuffer.push(alpha[1]);
+      return;
+    }
+    const bullet = line.match(/^[-*]\s+(.*)$/);
+    if(bullet){
+      flushPara();
+      if(listType && listType !== 'ul') flushList();
+      listType = 'ul';
+      listBuffer.push(bullet[1]);
+      return;
+    }
+    flushList();
+    paraBuffer.push(line);
+  });
+  flushPara(); flushList();
+  return html || '';
+}
+
+/* ============================================================
+   Question weight / numbering / scoring — shared by every screen
+   that lists questions, since form_completion questions occupy
+   several question numbers (one per blank) instead of just one.
+   ============================================================ */
+function questionWeight(q){
+  return q.type === 'form_completion' ? q.blanks.length : 1;
+}
+function totalWeight(questions){
+  return questions.reduce((sum,q)=>sum+questionWeight(q), 0);
+}
+function numberingMap(questions){
+  const map = {};
+  let n = 1;
+  questions.forEach(q=>{ map[q.id] = n; n += questionWeight(q); });
+  return map;
+}
+function buildPages(questions, perPage){
+  const pages = [];
+  let current = [], weight = 0;
+  questions.forEach(q=>{
+    const w = questionWeight(q);
+    if(current.length && weight + w > perPage){
+      pages.push(current); current = []; weight = 0;
+    }
+    current.push(q); weight += w;
+  });
+  if(current.length) pages.push(current);
+  return pages.length ? pages : [[]];
+}
+
+function isQuestionCorrect(q, given){
+  if(q.type === 'mcq'){
+    return given != null && given !== '' && Number(given) === q.correct;
+  }
+  if(q.type === 'multi_select'){
+    const givenSet = (given || '').split(',').filter(Boolean).map(Number).sort((a,b)=>a-b).join(',');
+    const correctSet = (q.correct || []).slice().sort((a,b)=>a-b).join(',');
+    return givenSet !== '' && givenSet === correctSet;
+  }
+  return (given||'').trim().toLowerCase() === String(q.correct).trim().toLowerCase();
+}
+
+function scoreSection(questions, answers){
+  let correct = 0, total = 0;
+  questions.forEach(q=>{
+    if(q.type === 'form_completion'){
+      q.blanks.forEach(b=>{
+        total++;
+        const given = answers[q.id+'-'+b.n];
+        if((given||'').trim().toLowerCase() === String(b.correct).trim().toLowerCase()) correct++;
+      });
+    } else {
+      total++;
+      if(isQuestionCorrect(q, answers[q.id])) correct++;
+    }
+  });
+  return { correct, total };
+}
+
+function reviewRowsHtml(questions, numMap, answers){
+  let html = '';
+  questions.forEach(q=>{
+    if(q.type === 'form_completion'){
+      q.blanks.forEach(b=>{
+        const globalNum = numMap[q.id] + b.n - 1;
+        const given = answers[q.id+'-'+b.n] || '—';
+        const ok = (given||'').trim().toLowerCase() === String(b.correct).trim().toLowerCase();
+        html += `<div class="review-row"><span class="mark ${ok?'correct':'wrong'}">${ok?'✓':'✕'}</span><span>${globalNum}. ${escapeHtml(q.prompt)} <em>(blank ${b.n})</em><br><span class="given">Your answer: ${escapeHtml(given)}${ok?'':' · Correct: '+escapeHtml(String(b.correct))}</span></span></div>`;
+      });
+    } else {
+      const globalNum = numMap[q.id];
+      const given = answers[q.id];
+      const ok = isQuestionCorrect(q, given);
+      let givenLabel, correctLabel;
+      if(q.type === 'mcq'){
+        givenLabel = q.options[given] ?? '—'; correctLabel = q.options[q.correct];
+      } else if(q.type === 'multi_select'){
+        const arr = (given||'').split(',').filter(Boolean).map(Number);
+        givenLabel = arr.length ? arr.map(i=>q.options[i]).join(', ') : '—';
+        correctLabel = q.correct.map(i=>q.options[i]).join(', ');
+      } else {
+        givenLabel = given || '—'; correctLabel = q.correct;
+      }
+      html += `<div class="review-row"><span class="mark ${ok?'correct':'wrong'}">${ok?'✓':'✕'}</span><span>${globalNum}. ${escapeHtml(q.prompt)}<br><span class="given">Your answer: ${escapeHtml(String(givenLabel))}${ok?'':' · Correct: '+escapeHtml(String(correctLabel))}</span></span></div>`;
+    }
+  });
+  return html;
+}
+
+/* ============================================================
+   DATA SCHEMA REFERENCE — read this before generating content.
+   seedTest() and the import/export functions below are the two
+   places new content actually enters the app. If you're using an
+   AI to bulk-generate tests/lessons, the cleanest path is: have it
+   produce ONE JSON file matching the "Import file" shape below,
+   then load it via the Import button in admin.html or the "Import
+   update" control in index.html — no manual clicking required.
+
+   TEST object:
+     {
+       id: string,              // any unique string, e.g. uid()
+       title: string,
+       description: string,
+       listening: {
+         sections: [ {          // one per audio recording (Section 1-4 style)
+           id: string,
+           sectionNumber: number,
+           audioNote: string,   // short description shown to students
+           instructions: string,// e.g. "Questions 1-5. Complete the notes below."
+           questions: [ ...Question ]
+         } ]
+       },
+       reading: {
+         passage: string,       // markdown-lite: blank line=paragraph, ## heading,
+                                 // "a) " lettered list, "- " bullet list
+         instructions: string,
+         questions: [ ...Question ]
+       },
+       writing: {
+         tasks: [ {
+           id: string, taskNumber: 1|2, instructions: string,
+           prompt: string, minWords: number
+           // chart/graph image (if any) is NOT stored on this object — it's
+           // a separate blob in IndexedDB's 'media' store, keyed by this
+           // task's id. To attach one via import, add an entry to the
+           // "media" array in the import file with ownerId = this task's id.
+         } ]
+       },
+       speaking: {
+         parts: [ {
+           id: string, partNumber: 1|2|3, title: string, instructions: string,
+           questions: [ { id: string, text: string, tip: string } ]
+         } ]
+       }
+     }
+
+   QUESTION variants (the `type` field decides which other fields exist):
+     mcq:             { id, type:'mcq', prompt, options:[string,...], correct: <index of right option> }
+     fill_blank:      { id, type:'fill_blank', prompt, correct: <string> }
+     tfng:            { id, type:'tfng', prompt, correct: 'True'|'False'|'Not Given' }
+     multi_select:    { id, type:'multi_select', prompt, options:[string,...], correct:[<indices>] }
+     form_completion: { id, type:'form_completion', prompt,
+                        template: string,     // lines of text with {1} {2} {3}... placeholders
+                        blanks: [ {n: number, correct: string} ] }  // n matches the {n} in template
+
+   LESSON object (just a title + one PDF, no other content):
+     { id: string, title: string, fileName: string }
+     // The PDF itself is a separate blob in IndexedDB's 'media' store,
+     // keyed by this lesson's id — same pattern as writing-task images.
+
+   IMPORT FILE (what Export produces, and what Import reads back):
+     {
+       exportedAt: string,      // ISO date, informational only
+       version: 1,
+       tests: [ ...Test ],
+       lessons: [ ...Lesson ],
+       audio: [ { ownerId: string, base64: string } ],  // ownerId = a listening section's id
+       media: [ { ownerId: string, base64: string } ]   // ownerId = a writing task's id, or a lesson's id
+     }
+     // `base64` must be a full data URL: "data:<mimetype>;base64,<data>" —
+     // e.g. "data:audio/mpeg;base64,//uQx..." or "data:application/pdf;base64,JVBERi0...".
+     // If an AI is generating this file, audio/PDF/image bytes are the
+     // awkward part to produce correctly — it's usually easier to leave
+     // "audio"/"media" empty in the generated file and attach the actual
+     // audio/PDF/images by hand afterward in admin.html, letting the AI
+     // focus on what it's actually good at: tests, questions, and lesson
+     // titles as plain structured text.
+   ============================================================ */
+
+/* ---------- seed content ---------- */
+function seedTest(){
+  return {
+    id: uid(),
+    title: 'IELTS Practice Test 1',
+    description: 'Full-length practice covering all four sections.',
+    listening: {
+      sections: [
+        {
+          id: uid(), sectionNumber: 1,
+          audioNote: 'A phone call between a new member and a gym receptionist, setting up a membership.',
+          instructions: 'Questions 1-8. Listen to the recording and answer the questions below.',
+          questions: [
+            { id: uid(), type:'form_completion', prompt:'Complete the membership form below. Write NO MORE THAN TWO WORDS AND/OR A NUMBER for each answer.',
+              template: 'Membership type: {1}\nStart date: {2}\nMonthly fee: £{3}',
+              blanks: [ {n:1, correct:'Premium'}, {n:2, correct:'Monday'}, {n:3, correct:'45'} ] },
+            { id: uid(), type:'multi_select', prompt:'Choose THREE letters. Which THREE items are included in the welcome pack?',
+              options:['Water bottle','Gym towel','T-shirt','Protein bar','Yoga mat','Locker key'], correct:[0,1,5] },
+            { id: uid(), type:'mcq', prompt:'What time does the pool open on weekends?', options:['7 am','8 am','9 am','10 am'], correct:1 },
+            { id: uid(), type:'tfng', prompt:'The gym offers free parking.', correct:'True' },
+          ]
+        },
+        {
+          id: uid(), sectionNumber: 2,
+          audioNote: 'A guided tour of a newly opened community library.',
+          instructions: '',
+          questions: [
+            { id: uid(), type:'mcq', prompt:'Where is the children\u2019s section located?', options:['Ground floor','First floor','Basement','Second floor'], correct:1 },
+            { id: uid(), type:'fill_blank', prompt:'Library membership cards can be collected at the ___.', correct:'front desk' },
+            { id: uid(), type:'tfng', prompt:'The library charges a fee for printing.', correct:'True' },
+            { id: uid(), type:'fill_blank', prompt:'The reading room closes at ___ on weekdays.', correct:'9pm' },
+          ]
+        },
+        {
+          id: uid(), sectionNumber: 3,
+          audioNote: 'Two students discussing a joint research project with their tutor.',
+          instructions: '',
+          questions: [
+            { id: uid(), type:'mcq', prompt:'What is the main topic of their research project?', options:['Urban transport','Renewable energy','Public health','Food security'], correct:1 },
+            { id: uid(), type:'tfng', prompt:'Both students have already collected their survey data.', correct:'False' },
+            { id: uid(), type:'fill_blank', prompt:'Their first draft is due in ___ weeks.', correct:'two' },
+            { id: uid(), type:'mcq', prompt:'Who will present the findings to the class?', options:['Only one student','Both students together','The tutor','A guest speaker'], correct:1 },
+          ]
+        },
+        {
+          id: uid(), sectionNumber: 4,
+          audioNote: 'An academic lecture on the history of urban planning.',
+          instructions: '',
+          questions: [
+            { id: uid(), type:'mcq', prompt:'According to the lecturer, what mainly drove early city planning?', options:['Aesthetics','Public health concerns','Military defence','Religious beliefs'], correct:1 },
+            { id: uid(), type:'fill_blank', prompt:'The lecturer refers to this period as the "___ era" of planning.', correct:'sanitary' },
+            { id: uid(), type:'tfng', prompt:'The lecturer believes modern planning has fully solved these issues.', correct:'False' },
+            { id: uid(), type:'fill_blank', prompt:'Students are asked to read chapter ___ before the next class.', correct:'four' },
+          ]
+        },
+      ]
+    },
+    reading: {
+      instructions: 'Read the passage below and answer Questions 1-6.',
+      passage: "## Rethinking urban power\n\nAcross the world, cities are rethinking how they power daily life. Rooftop solar panels have become a familiar sight on suburban homes, while some municipalities have begun covering car parks and bus shelters with photovoltaic canopies. Local governments argue that distributed generation — producing electricity close to where it is used — reduces strain on ageing transmission networks and shortens the distance power must travel.\n\nCritics, however, point out that the upfront cost of retrofitting older buildings can be prohibitive for low-income households, and that subsidies often benefit homeowners more than renters.\n\n## Transport joins in\n\nTransport planners have joined the conversation too, since electric buses depend on charging infrastructure that must be built alongside, rather than after, the vehicles themselves. Several transit authorities have started trialling battery-swap stations to avoid long charging queues during peak hours. Whether these approaches spread beyond pilot programmes will likely depend on how quickly the cost of storage technology continues to fall.",
+      questions: [
+        { id: uid(), type:'tfng', prompt:'Distributed generation increases the distance electricity must travel.', correct:'False' },
+        { id: uid(), type:'tfng', prompt:'Subsidies for solar retrofits always benefit renters more than homeowners.', correct:'False' },
+        { id: uid(), type:'mcq', prompt:'Why are transport planners involved in the discussion?', options:['Electric buses need charging infrastructure built early','Buses are being replaced by trains','Renters cannot afford new buses','Solar panels are used on buses'], correct:0 },
+        { id: uid(), type:'form_completion', prompt:'Complete the summary below. Write NO MORE THAN TWO WORDS from the passage for each answer.',
+          template: 'Some transit authorities are trialling {1} stations to reduce charging queues.\nThe spread of these approaches depends on the falling cost of {2} technology.',
+          blanks: [ {n:1, correct:'battery-swap'}, {n:2, correct:'storage'} ] },
+        { id: uid(), type:'multi_select', prompt:'Choose TWO letters. According to the passage, which TWO groups are mentioned as facing challenges?', options:['Low-income households','University students','Renters','Retirees','Tourists'], correct:[0,2] },
+        { id: uid(), type:'mcq', prompt:'What is described as prohibitive for low-income households?', options:['Monthly electricity bills','The upfront cost of retrofitting older buildings','Bus fares','Parking fees'], correct:1 },
+      ]
+    },
+    writing: {
+      tasks: [
+        { id: uid(), taskNumber:1, instructions:'You should spend about 20 minutes on this task. Write at least 150 words.', prompt:'The chart below shows the percentage of households with internet access in three countries between 2000 and 2020. Summarise the information by selecting and reporting the main features, and make comparisons where relevant.', minWords:150 },
+        { id: uid(), taskNumber:2, instructions:'You should spend about 40 minutes on this task. Write at least 250 words.', prompt:'Some people believe that students should choose subjects based on career prospects, while others think they should study what interests them most. Discuss both views and give your own opinion.', minWords:250 },
+      ]
+    },
+    speaking: {
+      parts: [
+        { id: uid(), partNumber:1, title:'Introduction and interview', instructions:'Answer briefly, in 1-2 sentences.',
+          questions:[ {id:uid(), text:'Do you work or study?', tip:''}, {id:uid(), text:'What do you like about your hometown?', tip:''}, {id:uid(), text:'Do you enjoy reading? Why or why not?', tip:'Give one reason and a brief example — you don\u2019t need a long answer here.'} ] },
+        { id: uid(), partNumber:2, title:'Describe a skill you would like to learn', instructions:'You have 1 minute to prepare, then speak for 1-2 minutes.',
+          questions:[ {id:uid(), text:'What the skill is', tip:''}, {id:uid(), text:'Why you want to learn it', tip:''}, {id:uid(), text:'How you would learn it', tip:''}, {id:uid(), text:'Explain how it would benefit you', tip:'This is often the weakest part of an answer — spend real time on it, not just a rushed sentence at the end.'} ] },
+        { id: uid(), partNumber:3, title:'Discussion', instructions:'Answer in more depth than Part 1 — explain your reasoning.',
+          questions:[ {id:uid(), text:'Why do you think lifelong learning has become more important?', tip:''}, {id:uid(), text:'Do you think schools do enough to teach practical skills?', tip:''}, {id:uid(), text:'How might learning skills change in the future with new technology?', tip:''} ] },
+      ]
+    }
+  };
+}
+
+/* Lessons are now just: a title + one uploaded PDF file. The PDF
+   itself is stored as a blob (in the 'media' store, same as writing-
+   task chart images) keyed by the lesson's own id — no separate
+   store needed since it's just another owner-id-keyed blob. */
+
+/* ============================================================
+   Migration / defensive normalization.
+   Runs on every load so older saved data (from before sections,
+   instructions, or speaking tips existed) never crashes the app —
+   it's quietly upgraded to the current shape instead.
+   ============================================================ */
+function normalizeTest(test){
+  test.title = test.title || 'Untitled test';
+  test.description = test.description || '';
+
+  if(!test.listening) test.listening = { sections: [] };
+  if(!Array.isArray(test.listening.sections)){
+    test.listening = {
+      sections: [{
+        id: uid(), sectionNumber: 1,
+        audioNote: test.listening.audioNote || '',
+        instructions: '',
+        questions: Array.isArray(test.listening.questions) ? test.listening.questions : [],
+      }]
+    };
+  }
+  test.listening.sections.forEach((s, i)=>{
+    s.id = s.id || uid();
+    s.sectionNumber = s.sectionNumber || i+1;
+    s.audioNote = s.audioNote || '';
+    s.instructions = s.instructions || '';
+    if(!Array.isArray(s.questions)) s.questions = [];
+  });
+
+  if(!test.reading) test.reading = { passage:'', instructions:'', questions:[] };
+  test.reading.passage = test.reading.passage || '';
+  test.reading.instructions = test.reading.instructions || '';
+  if(!Array.isArray(test.reading.questions)) test.reading.questions = [];
+
+  if(!test.writing) test.writing = { tasks:[] };
+  if(!Array.isArray(test.writing.tasks)) test.writing.tasks = [];
+  test.writing.tasks.forEach(t=>{ t.instructions = t.instructions || ''; });
+
+  if(!test.speaking) test.speaking = { parts:[] };
+  if(!Array.isArray(test.speaking.parts)) test.speaking.parts = [];
+  test.speaking.parts.forEach(p=>{
+    p.instructions = p.instructions || '';
+    if(!Array.isArray(p.questions)) p.questions = [];
+    p.questions = p.questions.map(q => typeof q === 'string' ? { id: uid(), text: q, tip: '' } : { id: q.id || uid(), text: q.text || '', tip: q.tip || '' });
+  });
+
+  return test;
+}
+
+function normalizeLesson(lesson){
+  lesson.title = lesson.title || 'Untitled lesson';
+  lesson.fileName = lesson.fileName || '';
+  // Older lessons authored as markdown+images (a previous design) still
+  // load fine — they just show as "no PDF uploaded yet" until the
+  // teacher attaches a PDF, since that content doesn't convert to one.
+  return lesson;
+}
+
+/* ============================================================
+   IndexedDB storage
+   - 'tests' store: full test objects, keyed by id
+   - 'lessons' store: full lesson objects, keyed by id
+   - 'audio' store: { testId, blob } — 'testId' is really a generic
+     "owner id" (a listening section's id)
+   - 'media' store: { ownerId, blob } — images, owned by a writing
+     task id or a lesson-image's own id
+   Blobs persist fine in IndexedDB, so audio/images survive reloads.
+   ============================================================ */
+let dbPromise = null;
+function openDB(){
+  if(dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject)=>{
+    try{
+      if(typeof indexedDB === 'undefined'){ reject(new Error('indexedDB is not available in this context')); return; }
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e)=>{
+        const db = e.target.result;
+        if(!db.objectStoreNames.contains('tests')) db.createObjectStore('tests', { keyPath:'id' });
+        if(!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath:'testId' });
+        if(!db.objectStoreNames.contains('media')) db.createObjectStore('media', { keyPath:'ownerId' });
+        if(!db.objectStoreNames.contains('lessons')) db.createObjectStore('lessons', { keyPath:'id' });
+      };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    }catch(err){
+      reject(err);
+    }
+  });
+  return dbPromise;
+}
+
+/* ---------- resilient fallback ----------
+   Some browsers block IndexedDB entirely for file:// pages. Rather
+   than the app going blank, every storage function falls back to an
+   in-memory store the moment IndexedDB fails, and keeps a flag the
+   UI shows as a banner. Data still works for the current session —
+   it just won't survive a refresh until served from a real origin. */
+let storageAvailable = true;
+const memTests = new Map();
+const memLessons = new Map();
+const memAudio = new Map();
+const memMedia = new Map();
+function isStorageAvailable(){ return storageAvailable; }
+function markStorageUnavailable(err){
+  if(storageAvailable){
+    storageAvailable = false;
+    console.warn('Persistent storage unavailable, using in-memory fallback for this session:', err);
+  }
+}
+
+async function getAllTests(){
+  if(!storageAvailable) return Array.from(memTests.values()).map(normalizeTest);
+  try{
+    const db = await openDB();
+    const tests = await new Promise((resolve, reject)=>{
+      const tx = db.transaction('tests','readonly');
+      const req = tx.objectStore('tests').getAll();
+      req.onsuccess = ()=>resolve(req.result || []);
+      req.onerror = ()=>reject(req.error);
+    });
+    return tests.map(normalizeTest);
+  }catch(err){
+    markStorageUnavailable(err);
+    return Array.from(memTests.values()).map(normalizeTest);
+  }
+}
+async function saveTestRecord(test){
+  memTests.set(test.id, test);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('tests','readwrite');
+      tx.objectStore('tests').put(test);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+async function deleteTestRecord(id){
+  memTests.delete(id);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('tests','readwrite');
+      tx.objectStore('tests').delete(id);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+
+async function getAllLessons(){
+  if(!storageAvailable) return Array.from(memLessons.values()).map(normalizeLesson);
+  try{
+    const db = await openDB();
+    const lessons = await new Promise((resolve, reject)=>{
+      const tx = db.transaction('lessons','readonly');
+      const req = tx.objectStore('lessons').getAll();
+      req.onsuccess = ()=>resolve(req.result || []);
+      req.onerror = ()=>reject(req.error);
+    });
+    return lessons.map(normalizeLesson);
+  }catch(err){
+    markStorageUnavailable(err);
+    return Array.from(memLessons.values()).map(normalizeLesson);
+  }
+}
+async function saveLessonRecord(lesson){
+  memLessons.set(lesson.id, lesson);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('lessons','readwrite');
+      tx.objectStore('lessons').put(lesson);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+async function deleteLessonRecord(id){
+  memLessons.delete(id);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('lessons','readwrite');
+      tx.objectStore('lessons').delete(id);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+
+async function saveAudioBlob(ownerId, blob){
+  memAudio.set(ownerId, blob);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('audio','readwrite');
+      tx.objectStore('audio').put({ testId: ownerId, blob });
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+async function getAudioBlob(ownerId){
+  if(!storageAvailable) return memAudio.get(ownerId) || null;
+  try{
+    const db = await openDB();
+    return await new Promise((resolve, reject)=>{
+      const tx = db.transaction('audio','readonly');
+      const req = tx.objectStore('audio').get(ownerId);
+      req.onsuccess = ()=>resolve(req.result ? req.result.blob : null);
+      req.onerror = ()=>reject(req.error);
+    });
+  }catch(err){
+    markStorageUnavailable(err);
+    return memAudio.get(ownerId) || null;
+  }
+}
+async function deleteAudioBlob(ownerId){
+  memAudio.delete(ownerId);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('audio','readwrite');
+      tx.objectStore('audio').delete(ownerId);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+
+async function saveMediaBlob(ownerId, blob){
+  memMedia.set(ownerId, blob);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('media','readwrite');
+      tx.objectStore('media').put({ ownerId, blob });
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+async function getMediaBlob(ownerId){
+  if(!storageAvailable) return memMedia.get(ownerId) || null;
+  try{
+    const db = await openDB();
+    return await new Promise((resolve, reject)=>{
+      const tx = db.transaction('media','readonly');
+      const req = tx.objectStore('media').get(ownerId);
+      req.onsuccess = ()=>resolve(req.result ? req.result.blob : null);
+      req.onerror = ()=>reject(req.error);
+    });
+  }catch(err){
+    markStorageUnavailable(err);
+    return memMedia.get(ownerId) || null;
+  }
+}
+async function deleteMediaBlob(ownerId){
+  memMedia.delete(ownerId);
+  if(!storageAvailable) return false;
+  try{
+    const db = await openDB();
+    await new Promise((resolve, reject)=>{
+      const tx = db.transaction('media','readwrite');
+      tx.objectStore('media').delete(ownerId);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+    return true;
+  }catch(err){ markStorageUnavailable(err); return false; }
+}
+
+/* ---------- blob <-> base64 (for bundling audio/images/PDFs into one portable JSON export) ---------- */
+function blobToBase64(blob){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result); // "data:<mime>;base64,<data>"
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+function base64ToBlob(dataUrl){
+  const commaIdx = dataUrl.indexOf(',');
+  const header = dataUrl.slice(0, commaIdx);
+  const base64 = dataUrl.slice(commaIdx + 1);
+  const mimeMatch = header.match(/data:(.*?);base64/);
+  const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for(let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+/* ---------- background content updates ----------
+   Lets index.html quietly check a hosted JSON file (e.g. a file in a
+   public GitHub repo) for newer content and auto-import it — same
+   format, same merge-by-id logic as manual Import, just automatic.
+   Always fails silently: no internet, a 404, a slow connection, or
+   the URL not being configured yet should never interrupt someone
+   taking a test. Returns the import counts on success, or null if
+   nothing was applied for any reason. */
+async function checkForContentUpdate(url){
+  if(!url || url.includes('YOUR-USERNAME')) return null; // not configured yet
+  if(typeof navigator !== 'undefined' && navigator.onLine === false) return null; // definitely offline, don't bother
+  try{
+    const controller = new AbortController();
+    const timeoutId = setTimeout(()=>controller.abort(), 6000);
+    const res = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+    clearTimeout(timeoutId);
+    if(!res.ok) return null;
+    const payload = await res.json();
+    return await applyImportedData(payload);
+  }catch(err){
+    console.warn('Content update check failed (expected if offline):', err);
+    return null;
+  }
+}
+
+/* ---------- import ----------
+   Shared by both admin.html (importing a backup/merge) and index.html
+   (students applying a content-update file their teacher hands them).
+   Reads a File, parses the export JSON, and restores tests/lessons/
+   audio/media. Callers pass onDone(counts, error) to handle the result
+   in whatever way fits their screen. */
+function importDataFile(input, onDone){
+  const file = input.files[0];
+  if(!file){ onDone && onDone(null, new Error('No file selected')); return; }
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try{
+      const payload = JSON.parse(reader.result);
+      const counts = await applyImportedData(payload);
+      onDone && onDone(counts, null);
+    }catch(err){
+      onDone && onDone(null, err);
+    }
+  };
+  reader.onerror = () => onDone && onDone(null, reader.error);
+  reader.readAsText(file);
+  input.value = '';
+}
+
+async function applyImportedData(payload){
+  const tests = Array.isArray(payload.tests) ? payload.tests : [];
+  const lessons = Array.isArray(payload.lessons) ? payload.lessons : [];
+  const audio = Array.isArray(payload.audio) ? payload.audio : [];
+  const media = Array.isArray(payload.media) ? payload.media : [];
+  let anyFailed = false;
+
+  for(const t of tests){ if(!(await saveTestRecord(normalizeTest(t)))) anyFailed = true; }
+  for(const l of lessons){ if(!(await saveLessonRecord(normalizeLesson(l)))) anyFailed = true; }
+  for(const a of audio){ if(!(await saveAudioBlob(a.ownerId, base64ToBlob(a.base64)))) anyFailed = true; }
+  for(const m of media){ if(!(await saveMediaBlob(m.ownerId, base64ToBlob(m.base64)))) anyFailed = true; }
+
+  // Clear caches (revoking first) so anything already open re-fetches the freshly imported blobs
+  Object.keys(audioUrlCache).forEach(k=>revokeCachedUrl(audioUrlCache, k));
+  Object.keys(mediaUrlCache).forEach(k=>revokeCachedUrl(mediaUrlCache, k));
+
+  return { tests: tests.length, lessons: lessons.length, anyFailed };
+}
+
+/* ---------- blob object-URL caches ----------
+   Each page load is its own JS runtime, so defining these here just
+   keeps the loading pattern identical in index.html and admin.html. */
+/* Revokes a cached blob: URL before it's replaced or removed, so repeated
+   uploads/deletes during a session don't leak object URLs. Safe to call
+   even if there's nothing cached yet (null/false/undefined all no-op). */
+function revokeCachedUrl(cache, ownerId){
+  const existing = cache[ownerId];
+  if(existing && typeof existing === 'string') URL.revokeObjectURL(existing);
+  delete cache[ownerId];
+}
+
+const audioUrlCache = {};
+async function ensureAudioLoaded(ownerId, onLoaded){
+  if(audioUrlCache[ownerId] !== undefined){ if(onLoaded) onLoaded(); return; }
+  audioUrlCache[ownerId] = null;
+  const blob = await getAudioBlob(ownerId);
+  audioUrlCache[ownerId] = blob ? URL.createObjectURL(blob) : false;
+  if(onLoaded) onLoaded();
+}
+
+const mediaUrlCache = {};
+async function ensureMediaLoaded(ownerId, onLoaded){
+  if(mediaUrlCache[ownerId] !== undefined){ if(onLoaded) onLoaded(); return; }
+  mediaUrlCache[ownerId] = null;
+  const blob = await getMediaBlob(ownerId);
+  mediaUrlCache[ownerId] = blob ? URL.createObjectURL(blob) : false;
+  if(onLoaded) onLoaded();
+}
